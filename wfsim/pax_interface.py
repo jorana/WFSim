@@ -32,6 +32,7 @@ class PaxEvents(object):
         last_right = -np.inf
         
         for channel, left, right, data in self.rawdata(instructions, self.truth_buffer):
+            
             if instructions['event_number'][self.rawdata.instruction_index] > event_i:
                 event.start_time=(first_left - 100000) * self.config['sample_duration']
                 event.stop_time=(last_right + 100000) * self.config['sample_duration']
@@ -72,7 +73,8 @@ default_config = {
     'zle_threshold':0,
     'run_number':10000, # Change run_number to prevent overwritting
     'events_per_file':1000,
-    'output_name':'./pax_data' # Each run will be saved to a subfolder under output_name
+    'output_name':'./pax_data', # Each run will be saved to a subfolder under output_name
+    "clustering_eps": 0.3 #mm same default as used in nSort
 }
 
 @export
@@ -92,7 +94,7 @@ class PaxEventSimulator(object):
 
         if self.config['fax_file']:
             if self.config['fax_file'][-5:] == '.root':
-                self.instructions = read_g4(self.config['fax_file'])
+                self.instructions = read_g4(self.config['fax_file'], self.config['clustering_eps'])
                 self.config['nevents'] = np.max(self.instructions['event_number'])
             else:
                 self.instructions = instruction_from_csv(self.config['fax_file'])
@@ -132,10 +134,8 @@ class PaxEventSimulator(object):
             self.events_per_file = self.config.get('events_per_file', 50)
             self.first_event_in_current_file = None
             self.last_event_written = None
-            
-            self.output_dir = os.path.join(self.config['output_name'], 
-                '%s_MC_%d' % (self.config['experiment'], self.config['run_number']))
-            #if not os.path.exists(self.output_dir): os.mkdir(self.output_dir)
+            self.output_dir = self.config['output_name']
+
             os.makedirs(self.output_dir, exist_ok=True)
             
             # Start the temporary file. Events will first be written here, until events_per_file is reached
@@ -158,10 +158,12 @@ class PaxEventSimulator(object):
             self.current_file.writestr(str(event_proxy.event_number), event_proxy.data['blob'])
 
             self.events_written_to_current_file += 1
+            
             self.last_event_written = event_proxy.event_number
         
         def close_current_file(self):
             """Closes the currently open file, if there is one. Also handles temporary file renaming. """
+
             if self.last_event_written is None:
                 #self.log.info("You didn't write any events... Did you crash pax?")
                 print("You didn't write any events... Did you crash pax?")
@@ -181,6 +183,6 @@ class PaxEventSimulator(object):
 
     def compute(self):
         for event in self.pax_event(self.instructions):            
-            event = self.transfer_plugin.transfer_event(event)    
+            event = self.transfer_plugin.transfer_event(event)
             self.output_plugin.write_event(event)
         self.output_plugin.close_current_file()

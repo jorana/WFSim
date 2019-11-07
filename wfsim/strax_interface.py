@@ -7,6 +7,8 @@ import nestpy
 import numpy as np
 import pandas as pd
 
+from sklearn.cluster import DBSCAN
+
 import strax
 from straxen.common import get_resource
 
@@ -15,7 +17,7 @@ from .core import RawData
 export, __all__ = strax.exporter()
 __all__ += ['instruction_dtype', 'truth_extra_dtype']
 
-instruction_dtype = [('event_number', np.int), ('type', np.int), ('t', np.int), 
+instruction_dtype = [('event_number', np.int), ('type', np.int), ('t', np.float32), 
     ('x', np.float32), ('y', np.float32), ('z', np.float32), 
     ('amp', np.int), ('recoil', '<U2')]
 
@@ -53,63 +55,131 @@ def rand_instructions(c):
 
     return instructions
 
-@export
-def read_g4(file):
+
+#Calculate the clustered values
+def cluster_function(x):
+    d = {}
+    #use the average position for each cluster weighted by energy
+    d["xp"] = np.average(x["xp"], weights=x["ed"])
+    d["yp"] = np.average(x["yp"], weights=x["ed"])
+    d["zp"] = np.average(x["zp"], weights=x["ed"])
+    d["time"] = np.average(x["time"], weights=x["ed"])
+    #Sum the energy
+    d["ed"] = np.sum(x["ed"])
     
+    #use for now the most abundant particle type for the cluster...
+    types, counts = np.unique(x.type, return_counts=True)
+    d["type"] = types[np.argmax(counts)]
+    
+    return pd.Series(d, index = ["xp", "yp", "zp", "time", "ed", "type"])
+
+
+@export
+def read_g4(file, eps=0.3):
+
     nc = nestpy.NESTcalc(nestpy.VDetector())
     A = 131.293
     Z = 54.
     density = 2.862  # g/cm^3   #SR1 Value
-    drift_field = 82  # V/cm    #SR1 Value
-    interaction = nestpy.INTERACTION_TYPE(7)
-
-    data = uproot.open(file)
-    all_ttrees = dict(data.allitems(filterclass=lambda cls: issubclass(cls, uproot.tree.TTreeMethods)))
-    e = all_ttrees[b'events/events;1']
-
-    time = e.array('time')
-    n_events = len(e.array('time'))
-    #lets separate the events in time by a constant time difference
-    time = time+np.arange(n_events)
-        
-    #Events should be in the TPC
-    xp = e.array("xp") / 10
-    yp = e.array("yp") /10 
-    zp = e.array("zp") /10 
-    e_dep = e.array('ed')
+    drift_field = 82  # V/cm    #SR1 Values
     
+    data = uproot.open(file)["events/events"]
+    df = data.pandas.df(["xp","yp", "zp", "time", "ed", "nsteps", "eventid", "type"])
+    #Add the interaction type in the correct format
+    #this is not working when not loading the type in the line above??
+    df["type"] = np.concatenate(data.array("type"))
+    df["type"] = df["type"].apply(lambda x: x.decode("UTF-8"))
+
+    df["time"] = df["time"]*1e9 # conversion to ns
+         
+    #Remove all values without energy depositon
+    df = df[df.ed != 0 ]
+
+    #Time Clustering
+    time_scale = 10 #ns ## select some resonabel time later...
+    dbscan_time_clustering = DBSCAN(eps=time_scale, min_samples=1)
+
+    df["time_cluster"] = np.concatenate(df[["time"]].groupby("entry").apply(lambda x: dbscan_time_clustering.fit_predict(x.time.values.reshape(-1,1)) ))
+
+    #Clustering in space
+    #Cluster in xyz for each event(entry) and each time_cluster
+    dbscan_clustering = DBSCAN(eps=eps, min_samples=1)
+    df["cluster"] = np.concatenate(df.groupby(["entry", "time_cluster"]).apply(lambda x:  dbscan_clustering.fit_predict(np.stack(x[["xp", "yp", "zp"]].values))).values)
+
+    #Apply the clustering for each event(entry), time_cluster and cluster
+    df = df.groupby(["entry","time_cluster","cluster"]).apply(lambda x: cluster_function(x))
+
+    df.xp /=10
+    df.yp /=10
+    df.zp /=10
+
+    #Limit the interactions to the TPC
     tpc_radius_square = 2500
     z_lower = -100
     z_upper = 0
+    df = df[(df.xp**2+df.yp**2<=47.9**2)&(df.zp<z_upper)&(df.zp>z_lower)]
+
+    #Sort the df for each event in time
+    df["index_dummy"] = df.index.get_level_values(0)
+    df = df.sort_values(["index_dummy", "time"])
+
+    #set time of first e deposition in each event to 0
+    df["time"] = df.groupby(["entry"]).apply(lambda x: (x["time"]-x["time"].min())).values
+
+    #try with longer times....
+    #df["time"] = df["time"]*10
+
+    # set the index to start from 0 and run to the final number of events 
+    # This is important for simulations with external sources where a lot of events never reach the xenon
+    idx = df.index.get_level_values(0)
+    idx_lims = np.append(np.intersect1d(idx,np.unique(idx), return_indices = True)[1],len(idx))
+    n_vals = [idx_lims[i+1] - idx_lims[i] for i in range(0,len(idx_lims)-1)]
+    new_entry_idx = pd.Int64Index(np.repeat(np.arange(len(n_vals)), n_vals), dtype = "int64", name = "entry")
     
-    TPC_Cut = (zp > z_lower) & (zp < z_upper) & (xp**2+yp**2 <tpc_radius_square)
-    xp = xp[TPC_Cut]
-    yp = yp[TPC_Cut]
-    zp = zp[TPC_Cut]
-    e_dep = e_dep[TPC_Cut]
-    time = time[TPC_Cut]
+    df.index = pd.MultiIndex.from_arrays([new_entry_idx,
+                                 df.index.get_level_values(1).values]
+                                 )
     
-    event_number = np.repeat(e.array("eventid"),e.array("nsteps"))[TPC_Cut.flatten()]
     
-    n_instructions = len(time.flatten())
+    #lets reset the time cluster index aswell
+    new_cluster_idx = pd.Int64Index(np.concatenate(df.groupby("entry").apply(lambda x: np.arange(len(x.index.get_level_values(1).values)))), dtype = "int64", name = "cluster")
+    
+    df.index = pd.MultiIndex.from_arrays([df.index.get_level_values(0).values,
+                                 new_cluster_idx]
+                                 )
+    
+    
+    #and separate the events in time by one second
+    event_spacing = 1e9
+    df.time = np.cumsum(df.time+ (df.index.get_level_values(1).values == 0 )*event_spacing)
+
+    #build the instructions
+    n_instructions = len(df)
     ins = np.zeros(2*n_instructions, dtype=instruction_dtype)
-
-    e_dep, ins['x'], ins['y'], ins['z'], ins['t'] = e_dep.flatten(), \
-                                                    np.repeat(xp.flatten(),2 )/ 10, \
-                                                    np.repeat(yp.flatten(),2 ) / 10, \
-                                                    np.repeat(zp.flatten(),2 ) / 10, \
-                                                    1e9*np.repeat(time.flatten(),2 )
     
-    
-    
-    ins['event_number'] = np.repeat(event_number,2)
+    #shift the time by a constant offset...
+    e_dep, ins['x'], ins['y'], ins['z'], ins['t'] = df.ed.values, \
+                                                    np.repeat(df.xp.values, 2), \
+                                                    np.repeat(df.yp.values, 2), \
+                                                    np.repeat(df.zp.values, 2), \
+                                                    np.repeat(df.time.values, 2)
+                                                    
+    ins["event_number"] = np.repeat(df.index.get_level_values(0).values,2)
     ins['type'] = np.tile((1, 2), n_instructions)
-    ins['recoil'] = np.repeat('er', 2 * n_instructions)
+    
+    #select the interaction type for NEST, use gamma (7) as default
+    #add more interactions here...
+    interaction_dict = {"e-": 8, "gamma": 7, "neutron": 0}
+    interaction = np.repeat([nestpy.INTERACTION_TYPE(interaction_dict.get(particle_type, 7)) for particle_type in df.type.values],2)
 
+    #get the recoil type here, set "er" as default 
+    recoil_dict = {"e-": "er", "gamma": "er", "neutron": "nr"}
+    ins['recoil'] =np.repeat([recoil_dict.get(particle_type, "er") for particle_type in df.type.values],2)
+    
     quanta = []
 
-    for en in e_dep:
-        y = nc.GetYields(interaction,
+    for en, inter in zip(e_dep, interaction):
+        y = nc.GetYields(inter,
                          en,
                          density,
                          drift_field,
@@ -120,11 +190,10 @@ def read_g4(file):
         quanta.append(nc.GetQuanta(y, density).electrons)
     ins['amp'] = quanta
     
-    #cut interactions without electrons or photons
+    #lets interactions without electrons or photons
     ins = ins[ins["amp"] > 0]
-    
-    return ins
 
+    return ins
 @export
 def instruction_from_csv(file):
     return pd.read_csv(file).to_records(index=False)
@@ -260,6 +329,7 @@ class FaxSimulatorPlugin(strax.Plugin):
 
     def _sort_check(self, result):
         if result['time'][0] < self.last_chunk_time + 5000:
+        #if result['time'][0] < self.last_chunk_time + 500:
             raise RuntimeError(
                 "Simulator returned chunks with insufficient spacing. "
                 "Last chunk's max time was {timeA}, "

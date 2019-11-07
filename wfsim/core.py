@@ -325,9 +325,9 @@ class S2(Pulse):
                                               self.config['electron_lifetime_liquid'])
         cy = self.config['electron_extraction_yield'] * electron_lifetime_correction
         
-        #why are there cy greater than 1? We should check this
+        #why are there cy greater than 1?
         cy = np.clip(cy, a_min = 0, a_max = 1)
-
+        
         n_electron = np.random.binomial(n=list(n_electron), p=cy)
 
         # Second generate photon timing and channel
@@ -625,7 +625,7 @@ class RawData(object):
         self.source_finished = False
         # if len(wfsim.strax_interface.instructions_dtype)>8:
 
-        for ix, instruction in enumerate(tqdm(instructions, desc='Simulating Raw Records')):
+        for ix, instruction in enumerate(tqdm(instructions, desc='Simulating Raw Records', mininterval=5)):
             # Once there is a 1 ms gap process and clean pulses cache
             # if self.pulses['ele_ap'].inst
             # # obj.attr_name exists.
@@ -686,10 +686,11 @@ class RawData(object):
             if self.left % 2 != 0: self.left -= 1 # Seems like a digizier effect
 
             # Use noise array to pave the fundation of the pulses
-            #self._raw_data = self.get_real_noise(self.right - self.left + 1)
-            self._raw_data = np.zeros((len(self.config['channels_in_detector']['tpc']),
-                self.right - self.left + 1), dtype=('<i8'))
-
+            self._raw_data = self.get_real_noise(self.right - self.left + 1)
+            #self._raw_data = np.zeros((len(self.config['channels_in_detector']['tpc']),
+                #self.right - self.left + 1), dtype=('<i8'))
+            
+            
             for ix, _pulse in enumerate(self.pulses_cache):
                 # Could round instead of trunc... no one cares!
                 adc_wave = - np.trunc(_pulse['current'] * self.current_2_adc).astype(int)
@@ -764,5 +765,22 @@ class RawData(object):
         id_t = np.random.randint(0, real_data_sample_size - length)
         data = self.resource.noise_data
         result = data[id_t:id_t + length]
-
+        
+        #lets scale the noist to 2D
+        
+        result = np.tile(result, [len(self.config['channels_in_detector']['tpc']) , 1])
+        result = result.astype(dtype=("<i8"))
+        
+        result = self.__roll_2d(result)
+        
         return result
+    
+    
+    def __roll_2d(self,array):
+        # Use this function to randomly roll the noise... 
+        # this is just for testing...
+        for i in range(len(array)):
+
+            array[i] = np.roll(array[i], np.random.randint(len(array[i])))
+
+        return array
