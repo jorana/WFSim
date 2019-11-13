@@ -90,7 +90,6 @@ class Pulse(object):
                               _channel_photon_reminders, _channel_photon_gains,
                               self._pmt_current_templates, self._template_length,
                               pulse_current)
-
             # For single event, data of pulse level is small enough to store in dataframe
             self._pulses.append(dict(
                 photons  = len(_channel_photon_timings),
@@ -218,7 +217,7 @@ class S1(Pulse):
 
     def __call__(self, instruction):
         _, _, t, x, y, z, n_photons, recoil_type, *rest = instruction  # temporary solution for instruction passing
-        ly = self.resource.s1_light_yield_map([[x, y, z]]) * self.config['s1_detection_efficiency']
+        ly = 1#self.resource.s1_light_yield_map([[x, y, z]]) * self.config['s1_detection_efficiency']
         n_photons = np.random.binomial(n=n_photons, p=ly)
 
         self.photon_timings(t, n_photons, recoil_type)
@@ -234,7 +233,7 @@ class S1(Pulse):
 
         channels = np.array(self.config['channels_in_detector']['tpc'])
         p_per_channel = self.resource.s1_pattern_map(points)[0]
-        p_per_channel[np.in1d(channels, self.turned_off_pmts)] = 0
+        # p_per_channel[np.in1d(channels, self.turned_off_pmts)] = 0
         p_per_channel /= np.sum(p_per_channel)
 
         self._photon_channels = np.random.choice(
@@ -314,7 +313,7 @@ class S2(Pulse):
         self._photon_channels = np.array([])
 
         positions = np.array([x, y]).T  # For map interpolation
-        sc_gain = self.resource.s2_light_yield_map(positions) * self.config['s2_secondary_sc_gain']
+        sc_gain = np.repeat(self.config['s2_secondary_sc_gain'],len(positions))#self.resource.s2_light_yield_map(positions) * self.config['s2_secondary_sc_gain']
 
         # Average drift time of the electrons
         self.drift_time_mean = - z / \
@@ -423,28 +422,26 @@ class S2(Pulse):
         # A fraction of photons are given uniformally to top pmts regardless of pattern
         p_random = self.config.get('randomize_fraction_of_s2_top_array_photons', 0)
         # Use pattern to get top channel probability
-        # p_pattern = self.s2_pattern_map(points)
-        p_pattern = self.s2_pattern_map_pp(points)
+        p_pattern = self.resource.s2_pattern_map(points)[0]
+        # p_pattern = self.s2_pattern_map_pp(points)
 
         # Probability of each bottom channels
-        p_per_channel_bottom = (1 - p_top) / len(self.config['channels_bottom']) \
-                               * np.ones_like(self.config['channels_bottom'])
+        # p_per_channel_bottom = (1 - p_top) / len(self.config['channels_bottom']) \
+        #                        * np.ones_like(self.config['channels_bottom'])
 
         # Randomly assign to channel given probability of each channel
         # Sum probabilities over channels should be 1
         self._photon_channels = np.array([])
         for u, n in zip(*np.unique(self._instruction, return_counts=True)):
-            p_per_channel_top = p_pattern[u] / np.sum(p_pattern[u]) * p_top * (1 - p_random)
+            # p_per_channel_top = p_pattern[u] / np.sum(p_pattern[u]) * p_top * (1 - p_random)
             channels = np.array(self.config['channels_in_detector']['tpc'])
-            p_per_channel = np.concatenate([p_per_channel_top, p_per_channel_bottom])
-            # p_per_channel[np.in1d(channels, self.turned_off_pmts)] = 0
-
+            # p_per_channel = np.concatenate([p_per_channel_top, p_per_channel_bottom])
+            # # p_per_channel[np.in1d(channels, self.turned_off_pmts)] = 0
             _photon_channels = np.random.choice(
                 channels,
                 size=n,
-                p=p_per_channel / np.sum(p_per_channel),
+                p=p_pattern / np.sum(p_pattern),
                 replace=True)
-
             self._photon_channels = np.append(self._photon_channels, _photon_channels)
 
         self._photon_channels = self._photon_channels.astype(int)
@@ -619,18 +616,15 @@ class RawData(object):
         self.pulses_cache = []
         self._raw_data = []
         self.source_finished = False
-        # if len(wfsim.strax_interface.instructions_dtype)>8:
 
         for ix, instruction in enumerate(tqdm(instructions, desc='Simulating Raw Records')):
             # Once there is a 1 ms gap process and clean pulses cache
-            # if self.pulses['ele_ap'].inst
-            # # obj.attr_name exists.
             if len(instruction) > 8:
                 for par in instruction.dtype.names:
                     if par in self.config:
                         self.config[par] = instruction[par]
 
-            if instruction['t'] > self.last_pulse_end_time + 1e7:
+            if instruction['time'] > self.last_pulse_end_time + 1e5:
                 # Transform "pulses" into raw records
                 self.digitize_pulse_cache()
                 yield from self.ZLE()
@@ -639,7 +633,6 @@ class RawData(object):
             # Go on generating pulses from instruction
             self.sim_data(instruction)
             # For each instruction, truth will be wrote to buffer
-            # print(truth_buffer)
             if len(truth_buffer):
                 self.get_truth(instruction, truth_buffer)
 
@@ -649,7 +642,7 @@ class RawData(object):
         self.source_finished = True
         self.digitize_pulse_cache()
         yield from self.ZLE()
-        
+
     @staticmethod
     def symtype(ptype):
         return ['s1', 's2'][ptype - 1]
@@ -659,10 +652,9 @@ class RawData(object):
         self.pulses[ptype](instruction)
         self.pulses['ele_ap'](self.pulses[ptype])
         self.pulses['pmt_ap'](self.pulses[ptype])
-        #
+
         for pt in [ptype, 'ele_ap', 'pmt_ap']:
             self.pulses_cache += getattr(self.pulses[pt], '_pulses')
-        #
         if len(self.pulses['ele_ap']._pulses)  > 0:
             self.pulses['pmt_ap'](self.pulses['ele_ap'])
             self.pulses_cache += getattr(self.pulses['pmt_ap'], '_pulses')
@@ -691,7 +683,7 @@ class RawData(object):
                 adc_wave = - np.trunc(_pulse['current'] * self.current_2_adc).astype(int)
                 self._raw_data[_pulse['channel'],
                     _pulse['left'] - self.left:_pulse['right'] - self.left + 1] += adc_wave
-                
+
             self.pulses_cache = [] # Memory control
 
             # Digitizers have finite number of bits per channel, so clip the signal.
@@ -704,10 +696,10 @@ class RawData(object):
         # Ask for memory allocation just once
         if 'zle_intervals_buffer' not in self.__dict__:
             self.zle_intervals_buffer = -1 * np.ones((50000, 2), dtype=np.int64)
-        
+
         for ix, data in enumerate(self._raw_data):
             # For simulated data taking reference baseline as baseline
-            # Operating directly on digitized downward waveform        
+            # Operating directly on digitized downward waveform
             if ix in self.config.get('special_thresholds', {}):
                 threshold = self.config['digitizer_reference_baseline'] \
                     - self.config['special_thresholds'][str(pulse.channel)] - 1
@@ -741,12 +733,14 @@ class RawData(object):
                 truth_buffer[ix]['t_first_{name}'.format(name=name)] = np.min(times)
                 truth_buffer[ix]['t_last_{name}'.format(name=name)] = np.max(times)
                 truth_buffer[ix]['t_sigma_{name}'.format(name=name)] = np.std(times)
+                truth_buffer[ix]['t_last_{name}'.format(name=name)] = np.max(times)
             else:
                 truth_buffer[ix]['n_{name}'.format(name=name)] = 0
                 truth_buffer[ix]['t_mean_{name}'.format(name=name)] = np.nan
                 truth_buffer[ix]['t_first_{name}'.format(name=name)] = np.nan
                 truth_buffer[ix]['t_last_{name}'.format(name=name)] = np.nan
                 truth_buffer[ix]['t_sigma_{name}'.format(name=name)] = np.nan
+        truth_buffer[ix]['endtime'] = np.max([truth_buffer[ix]['t_last_photon'],truth_buffer[ix]['t_last_electron']]).astype(np.int64)
         for name in instruction.dtype.names:
             truth_buffer[ix][name] = instruction[name]
         truth_buffer[ix]['fill'] = True
@@ -762,3 +756,57 @@ class RawData(object):
         result = data[id_t:id_t + length]
 
         return result
+
+
+
+@export
+class RawDataNV(RawData):
+
+    def __init__(self, config):
+        self.config = config
+        self.pulses = dict(
+            peak=Peak(config)
+         )
+        self.pulses_cache = []
+        self.resource = Resource(self.config)
+
+    def __call__(self, instructions, truth_buffer=None):
+        self.last_pulse_end_time = 0
+        self.pulses_cache = []
+        self._raw_data = []
+        self.source_finished = False
+
+        for ix, instruction in enumerate(tqdm(instructions, desc='Simulating Raw Records')):
+            # Once there is a 1 ms gap process and clean pulses cache
+            # if self.pulses['ele_ap'].inst
+            # # obj.attr_name exists.
+            if len(instruction) > 8:
+                for par in instruction.dtype.names:
+                    if par in self.config:
+                        self.config[par] = instruction[par]
+
+            if instruction['t'] > self.last_pulse_end_time + 1e7:
+                # Transform "pulses" into raw records
+                self.digitize_pulse_cache()
+                yield from self.ZLE()
+                self.pulses_cache = []
+
+            # Go on generating pulses from instruction
+            self.sim_data(instruction)
+            # For each instruction, truth will be wrote to buffer
+            # print(truth_buffer)
+            if len(truth_buffer):
+                self.get_truth(instruction, truth_buffer)
+
+            # The instruction index is saved for chunking
+            self.instruction_index = ix
+
+        self.source_finished = True
+        self.digitize_pulse_cache()
+        yield from self.ZLE()
+
+    def sim_data(self, instruction):
+        self.pulses[peak](instruction)
+        self.pulses_cache = self.pulses[peak]._pulses
+        self.last_pulse_end_time = max(self.last_pulse_end_time,
+                np.max([p['right'] for p in self.pulses_cache]) * 10)

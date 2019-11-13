@@ -1,12 +1,7 @@
-import io
-import socket
-import sys
-import tarfile
 import os.path as osp
 import os
-import inspect
 import urllib.request
-
+from scipy.spatial import cKDTree
 import logging
 import re
 
@@ -137,8 +132,7 @@ def init_spe_scaling_factor_distributions(file):
         uniform_to_pe_arr.append(interp1d(cdf, scaled_bins))
     if uniform_to_pe_arr != []:
         return uniform_to_pe_arr
-    
-from scipy.spatial import cKDTree
+
 
 class InterpolateAndExtrapolate(object):
     """Linearly interpolate- and extrapolate using inverse-distance
@@ -209,9 +203,12 @@ class InterpolatingMap(object):
     """
     data_field_names = ['timestamp', 'description', 'coordinate_system',
                     'name', 'irregular']
-    def __init__(self, data, fmt):
+    def __init__(self, data, fmt=None):
         self.log = logging.getLogger('InterpolatingMap')
-        self.data = get_resource(data, fmt)
+        if fmt !=None:
+            self.data = get_resource(data, fmt)
+        else:
+            self.data = data
 
         self.coordinate_system = cs = self.data['coordinate_system']
         if not len(cs):
@@ -243,13 +240,13 @@ class InterpolatingMap(object):
                 # and always return a single value
                 def itp_fun(positions):
                     return map_data * np.ones_like(positions)
-            elif len(map_data.shape) == self.dimensions + 1:
-                map_data = map_data.reshape((-1, map_data.shape[-1]))
-                itp_fun = InterpolateAndExtrapolateArray(points=np.array(cs),
+            # elif len(map_data.shape) == self.dimensions + 1:
+            map_data = map_data.reshape((-1, map_data.shape[-1]))
+            itp_fun = InterpolateAndExtrapolateArray(points=np.array(cs),
                                                     values=np.array(map_data))
-            else:
-                itp_fun = InterpolateAndExtrapolate(points=np.array(cs),
-                                                    values=np.array(map_data))
+            # else:
+            #     itp_fun = InterpolateAndExtrapolate(points=np.array(cs),
+            #                                         values=np.array(map_data))
 
             self.interpolators[map_name] = itp_fun
 
