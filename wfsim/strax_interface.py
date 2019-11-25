@@ -7,21 +7,23 @@ import nestpy
 import numpy as np
 import pandas as pd
 
-from sklearn.cluster import DBSCAN
-
 import strax
 from straxen.common import get_resource
 
 from .core import RawData
+from sklearn.cluster import DBSCAN
 
 export, __all__ = strax.exporter()
 __all__ += ['instruction_dtype', 'truth_extra_dtype']
 
-instruction_dtype = [('event_number', np.int), ('type', np.int), ('t', np.float32), 
+instruction_dtype = [('event_number', np.int), ('type', np.int), ('t', np.int64), 
     ('x', np.float32), ('y', np.float32), ('z', np.float32), 
-    ('amp', np.int), ('recoil', '<U2')]
+    ('amp', np.int), ('recoil', '<U2'), ('e_dep', np.float32)]
 
-truth_extra_dtype = [('n_photon', np.float), ('n_electron', np.float),
+
+truth_extra_dtype = [
+    ('n_electron', np.float),
+    ('n_photon', np.float), ('n_photon_bottom', np.float),
     ('t_first_photon', np.float), ('t_last_photon', np.float), 
     ('t_mean_photon', np.float), ('t_sigma_photon', np.float), 
     ('t_first_electron', np.float), ('t_last_electron', np.float), 
@@ -55,7 +57,6 @@ def rand_instructions(c):
 
     return instructions
 
-
 #Calculate the clustered values
 def cluster_function(x):
     d = {}
@@ -82,6 +83,9 @@ def read_g4(file, eps=0.3):
     Z = 54.
     density = 2.862  # g/cm^3   #SR1 Value
     drift_field = 82  # V/cm    #SR1 Values
+    
+    #get the simulation source
+    source = uproot.open(file)["generator"]["SourceType"]._fTitle.decode("UTF-8")
     
     data = uproot.open(file)["events/events"]
     df = data.pandas.df(["xp","yp", "zp", "time", "ed", "nsteps", "eventid", "type"])
@@ -164,13 +168,42 @@ def read_g4(file, eps=0.3):
                                                     np.repeat(df.zp.values, 2), \
                                                     np.repeat(df.time.values, 2)
                                                     
+    ins["e_dep"] = np.repeat(df.ed.values, 2)
     ins["event_number"] = np.repeat(df.index.get_level_values(0).values,2)
+    
+    #try to set everythin exept the last event to event number = 0...
+    #idx = np.repeat(df.index.get_level_values(0).values,2)
+    #ins["event_number"] = np.clip(idx-idx[-1]+1, a_min = 0, a_max =np.inf)
+    
+    #ins["event_number"] = np.zeros(2*n_instructions)
     ins['type'] = np.tile((1, 2), n_instructions)
     
+    p_type = df.type.values
+    #lets take the gamma model for betas with low energies
+    #https://indico.fnal.gov/event/18104/session/14/contribution/90/material/0/0.pdf
+    #lets try 500 for now
+    p_type = np.where((e_dep<500)&(p_type == "e-"), "gamma", p_type)
+
+    
+    #NEST handling...
+    #https://github.com/NESTCollaboration/nest/blob/master/src/NEST.cpp
+    #line 406
+    #https://arxiv.org/pdf/1106.1613.pdf page 18
+    if "Kr83" in source:
+        print("Kr83m in source, modify e_dep and types")
+        
+        #To use the special 9.4 keV case in NEST the energy has to be exactly 9.4 keV
+        e_dep = np.where((e_dep<9.5)&(e_dep>9.3), 9.4 , e_dep)
+        #change the particle type for the 9.4 keV line to Kr83m
+        #p_type = np.where((e_dep<9.5)&(e_dep>9.3), "Kr83m" , p_type)
+        #Why do i also have to apply the Kr83m model to the 32 keV line?
+        p_type = np.array(["Kr83m"]*len(p_type))
+    
+    df["type"] = p_type
     #select the interaction type for NEST, use gamma (7) as default
     #add more interactions here...
-    interaction_dict = {"e-": 8, "gamma": 7, "neutron": 0}
-    interaction = np.repeat([nestpy.INTERACTION_TYPE(interaction_dict.get(particle_type, 7)) for particle_type in df.type.values],2)
+    interaction_dict = {"e-": 8, "gamma": 7, "neutron": 0, "Kr83m": 11}
+    interaction = [nestpy.INTERACTION_TYPE(interaction_dict.get(particle_type, 7)) for particle_type in p_type]
 
     #get the recoil type here, set "er" as default 
     recoil_dict = {"e-": "er", "gamma": "er", "neutron": "nr"}
@@ -190,10 +223,14 @@ def read_g4(file, eps=0.3):
         quanta.append(nc.GetQuanta(y, density).electrons)
     ins['amp'] = quanta
     
+    
     #lets interactions without electrons or photons
     ins = ins[ins["amp"] > 0]
+    
+    
 
     return ins
+
 @export
 def instruction_from_csv(file):
     return pd.read_csv(file).to_records(index=False)
@@ -211,33 +248,30 @@ class ChunkRawRecords(object):
         samples_per_record = strax.DEFAULT_RECORD_LENGTH
         buffer_length = len(self.record_buffer)
         dt = self.config['sample_duration']
+        rext = self.config['right_raw_extension']
+        cksz = self.config['chunk_size'] * 1e9
+        
+        self.blevel = buffer_filled_level = 0
+        self.chunk_time = np.min(instructions['t']) + cksz # Starting chunk
 
-        chunk_i = record_j = 0 # Indices of chunk(event), record buffer
         for channel, left, right, data in self.rawdata(instructions, self.truth_buffer):
             pulse_length = right - left + 1
             records_needed = int(np.ceil(pulse_length / samples_per_record))
 
-            # Currently chunk is decided by instruction using event_number
-            # TODO: mimic daq strax insertor chunking
-            chunk_i =0
-            if instructions['event_number'][self.rawdata.instruction_index] > chunk_i:
-                yield self.final_results(record_j)
-                record_j = 0 # Reset record buffer
-                self.truth_buffer['fill'] = np.zeros_like(len(self.truth_buffer)) # Reset truth buffer
-                chunk_i = instructions['event_number'][self.rawdata.instruction_index]
+            if left * 10 > self.chunk_time + 2 * rext:    
+                yield from self.final_results()
+                self.chunk_time += cksz
 
-            if record_j + records_needed > buffer_length:
+            if self.blevel + records_needed > buffer_length:
                 log.warning('Chunck size too large, insufficient record buffer')
-                yield self.final_results(record_j)
-                record_j = 0
-                self.truth_buffer['fill'] = np.zeros_like(len(self.truth_buffer))
-            
-            if record_j + records_needed > buffer_length:
-                log.Warning('Pulse length too large, insufficient record buffer, skipping pulse')
+                yield from self.final_results()
+
+            if self.blevel + records_needed > buffer_length:
+                log.warning('Pulse length too large, insufficient record buffer, skipping pulse')
                 continue
 
             # WARNING baseline and area fields are zeros before finish_results
-            s = slice(record_j, record_j + records_needed)
+            s = slice(self.blevel, self.blevel + records_needed)
             self.record_buffer[s]['channel'] = channel
             self.record_buffer[s]['dt'] = dt
             self.record_buffer[s]['time'] = dt * (left + samples_per_record * np.arange(records_needed))
@@ -247,24 +281,33 @@ class ChunkRawRecords(object):
             self.record_buffer[s]['record_i'] = np.arange(records_needed)
             self.record_buffer[s]['data'] = np.pad(data, 
                 (0, records_needed * samples_per_record - pulse_length), 'constant').reshape((-1, samples_per_record))
+            self.blevel += records_needed
 
-            record_j += records_needed
+        yield from self.final_results()
 
-        yield self.final_results(record_j)
+    def final_results(self):
+        records = self.record_buffer[:self.blevel] # No copying the records from buffer
+        maska = records['time'] < self.chunk_time
+        records = records[maska]
 
-    def final_results(self, record_j):
-        records = self.record_buffer[:record_j] # Copy the records from buffer
-        records = strax.sort_by_time(records) # Must keep this for sorted output
+        records = strax.sort_by_time(records) # Do NOT remove this line
         strax.baseline(records)
         strax.integrate(records)
 
-        _truth = self.truth_buffer[self.truth_buffer['fill']]
-        # Return truth without 'fill' field
-        truth = np.zeros(len(_truth), dtype=instruction_dtype + truth_extra_dtype)
-        for name in truth.dtype.names:
-            truth[name] = _truth[name]
+        maskb = self.truth_buffer['fill'] & (self.truth_buffer['t_first_photon'] < self.chunk_time)
+        truth = self.truth_buffer[maskb]
+        self.truth_buffer[maskb]['fill'] = False
 
-        return dict(raw_records=records, truth=truth)
+        truth.sort(order='t_first_photon')
+        # Return truth without 'fill' field
+        _truth = np.zeros(len(truth), dtype=instruction_dtype + truth_extra_dtype)
+        for name in _truth.dtype.names:
+            _truth[name] = truth[name]
+
+        yield dict(raw_records=records, truth=_truth)
+        
+        self.record_buffer[:np.sum(~maska)] = self.record_buffer[:self.blevel][~maska]
+        self.blevel = np.sum(~maska)
 
     def source_finished(self):
         return self.rawdata.source_finished
@@ -288,6 +331,7 @@ class ChunkRawRecords(object):
                  default=2),
     strax.Option('samples_to_store_after',
                  default=20),
+    strax.Option('right_raw_extension', default=10000),
     strax.Option('trigger_window', default=50),
     strax.Option('zle_threshold', default=0))
 class FaxSimulatorPlugin(strax.Plugin):
@@ -313,7 +357,7 @@ class FaxSimulatorPlugin(strax.Plugin):
 
         if c['fax_file']:
             if c['fax_file'][-5:] == '.root':
-                self.instructions = read_g4(c['fax_file'])
+                self.instructions = read_g4(c['fax_file'],c['clustering_eps'])
                 c['nevents'] = np.max(self.instructions['event_number'])
             else:
                 self.instructions = instruction_from_csv(c['fax_file'])
@@ -329,7 +373,6 @@ class FaxSimulatorPlugin(strax.Plugin):
 
     def _sort_check(self, result):
         if result['time'][0] < self.last_chunk_time + 5000:
-        #if result['time'][0] < self.last_chunk_time + 500:
             raise RuntimeError(
                 "Simulator returned chunks with insufficient spacing. "
                 "Last chunk's max time was {timeA}, "
@@ -372,5 +415,5 @@ class RawRecordsFromFax(FaxSimulatorPlugin):
             result = next(self.sim_iter)
         except StopIteration:
             raise RuntimeError("Bug in chunk count computation")
-        self._sort_check(result['raw_records'])
+        # self._sort_check(result['raw_records'])
         return result
