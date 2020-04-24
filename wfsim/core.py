@@ -5,13 +5,18 @@ import numpy as np
 from scipy.interpolate import interp1d
 from tqdm import tqdm
 
-from .load_resource import Resource
-from .utils import find_intervals_below_threshold, exporter
+from .load_resource import load_config
+from strax import exporter
 from . import units
+from .utils import find_intervals_below_threshold
 
 export, __all__ = exporter()
+__all__.append('PULSE_TYPE_NAMES')
 
 log = logging.getLogger('SimulationCore')
+
+PULSE_TYPE_NAMES = ('RESERVED', 's1', 's2', 'unknown', 'pi_el', 'pmt_ap', 'pe_el')
+
 
 @export
 class Pulse(object):
@@ -20,7 +25,7 @@ class Pulse(object):
     def __init__(self, config):
         self.config = config
         self.config.update(getattr(self.config, self.__class__.__name__, {}))
-        self.resource = Resource(config)
+        self.resource = load_config(config)
 
         self.init_pmt_current_templates()
         self.init_spe_scaling_factor_distributions()
@@ -41,10 +46,11 @@ class Pulse(object):
         # The pulse cache should be immediately transfered after call this function
         self.clear_pulse_cache()
 
-        # Correct for PMT Transition Time Spread
-        self._photon_timings += np.random.normal(self.config['pmt_transit_time_mean'],
-                                                 self.config['pmt_transit_time_spread'],
-                                                 len(self._photon_timings))
+        # Correct for PMT Transition Time Spread (skip for pmt afterpulses)
+        if '_photon_gains' not in self.__dict__:
+            self._photon_timings += np.random.normal(self.config['pmt_transit_time_mean'],
+                                                     self.config['pmt_transit_time_spread'],
+                                                     len(self._photon_timings))
 
         dt = self.config.get('sample_duration', 10) # Getting dt from the lib just once
         self._n_double_pe = self._n_double_pe_bot = 0 # For truth aft output
@@ -54,6 +60,7 @@ class Pulse(object):
             # Use 'counts' amount of photon for this channel 
             _channel_photon_timings = self._photon_timings[counts_start:counts_start+counts]
             counts_start += counts
+            if channel in self.turned_off_pmts: continue
 
             # Compute sample index（quotient）and reminder
             # Determined by division between photon timing and sample duraiton.
@@ -65,9 +72,14 @@ class Pulse(object):
             # Sample from spe scaling factor distribution and to individual gain
             # In contrast to pmt afterpulse that should have gain determined before this step
             if '_photon_gains' not in self.__dict__:
-                _channel_photon_gains = self.config['gains'][channel] \
+                if self.config['detector'] == 'XENON1T':
+                    _channel_photon_gains = self.config['gains'][channel] \
                     * self.uniform_to_pe_arr[channel](np.random.random(len(_channel_photon_timings)))
 
+                else:
+                    _channel_photon_gains = self.config['gains'][channel] \
+                    * self.uniform_to_pe_arr[0](np.random.random(len(_channel_photon_timings)))
+                    
                 # Add some double photoelectron emission by adding another sampled gain
                 n_double_pe = np.random.binomial(len(_channel_photon_timings),
                                                  p=self.config['p_double_pe_emision'])
@@ -77,8 +89,12 @@ class Pulse(object):
 
                 _dpe_index = np.random.choice(np.arange(len(_channel_photon_timings)),
                                               size=n_double_pe, replace=False)
-                _channel_photon_gains[_dpe_index] += self.config['gains'][channel] \
+                if self.config['detector'] == 'XENON1T':
+                    _channel_photon_gains[_dpe_index] += self.config['gains'][channel] \
                     * self.uniform_to_pe_arr[channel](np.random.random(n_double_pe))
+                else:
+                    _channel_photon_gains[_dpe_index] += self.config['gains'][channel] \
+                    * self.uniform_to_pe_arr[0](np.random.random(n_double_pe))
             else:
                 _channel_photon_gains = np.array(self._photon_gains[self._photon_channels == channel])
 
@@ -232,7 +248,7 @@ class S1(Pulse):
             #for some reason light yield map crashes TODO
             ly = 1
         else:
-            self.resource.s1_light_yield_map(positions) * self.config['s1_detection_efficiency']
+            ly = self.resource.s1_light_yield_map(positions) * self.config['s1_detection_efficiency']
         n_photons = np.random.binomial(n=n_photons, p=ly)
 
         self._photon_timings = np.array([])
@@ -386,7 +402,8 @@ class S2(Pulse):
         # Diffusion model from Sorensen 2011
         drift_time_mean = - z / \
                           self.config['drift_velocity_liquid'] + self.config['drift_time_gate']
-        drift_time_stdev = np.sqrt(2 * self.config['diffusion_constant_liquid'] * drift_time_mean)
+        _drift_time_mean = np.clip(drift_time_mean, 0, None)
+        drift_time_stdev = np.sqrt(2 * self.config['diffusion_constant_liquid'] * _drift_time_mean)
         drift_time_stdev /= self.config['drift_velocity_liquid']
         # Calculate electron arrival times in the ELR region
         _electron_timings = t + \
@@ -504,7 +521,6 @@ class PhotoIonization_Electron(S2):
 
     def __init__(self, config):
         super().__init__(config)
-        self.element_list = ['liquid']
         self._photon_timings = []
 
     def generate_instruction(self, signal_pulse, signal_pulse_instruction):
@@ -519,7 +535,8 @@ class PhotoIonization_Electron(S2):
 
         # To save calculation we first find out how many photon will give rise ap
         n_electron = np.random.poisson(delaytime_pmf_hist.n
-                                       * len(signal_pulse._photon_timings))
+                                       * len(signal_pulse._photon_timings)
+                                       * self.config['photoionization_modifier'])
 
         ap_delay = delaytime_pmf_hist.get_random(n_electron).clip(
             self.config['drift_time_gate'] + 1, None)
@@ -532,6 +549,56 @@ class PhotoIonization_Electron(S2):
         instruction = np.repeat(signal_pulse_instruction[0], n_electron)
 
         instruction['type'] = 4 # pi_el
+        instruction['time'] = t_zeros
+        instruction['x'], instruction['y'] = self._rand_position(n_electron)
+        instruction['z'] = - (ap_delay - self.config['drift_time_gate']) * \
+            self.config['drift_velocity_liquid']
+        instruction['amp'] = 1
+
+        return instruction
+
+    def _rand_position(self, n):
+        Rupper = 46
+
+        r = np.sqrt(np.random.uniform(0, Rupper*Rupper, n))
+        angle = np.random.uniform(-np.pi, np.pi, n)
+
+        return r * np.cos(angle), r * np.sin(angle)
+
+
+@export
+class PhotoElectric_Electron(S2):
+    """
+    Produce electron after S2 pulse simulation, using a gaussian distribution
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self._photon_timings = []
+
+    def generate_instruction(self, signal_pulse, signal_pulse_instruction):
+        if len(signal_pulse._photon_timings) == 0: return []
+        return self.electron_afterpulse(signal_pulse, signal_pulse_instruction)
+
+    def electron_afterpulse(self, signal_pulse, signal_pulse_instruction):
+
+        n_electron = np.random.poisson(self.config['photoelectric_p']
+                                       * len(signal_pulse._photon_timings)
+                                       * self.config['photoelectric_modifier'])
+
+        ap_delay = np.clip(
+            np.random.normal(self.config['photoelectric_t_center'] + self.config['drift_time_gate'], 
+                             self.config['photoelectric_t_spread'],
+                             n_electron), 0, None)
+
+        # Randomly select original photon as time zeros
+        t_zeros = signal_pulse._photon_timings[np.random.randint(
+            low=0, high=len(signal_pulse._photon_timings),
+            size=n_electron)]
+
+        instruction = np.repeat(signal_pulse_instruction[0], n_electron)
+
+        instruction['type'] = 6 # pe_el
         instruction['time'] = t_zeros
         instruction['x'], instruction['y'] = self._rand_position(n_electron)
         instruction['z'] = - (ap_delay - self.config['drift_time_gate']) * \
@@ -584,7 +651,8 @@ class PMT_Afterpulse(Pulse):
             rU0 = 1 - np.random.uniform(size=len(signal_pulse._photon_timings))
 
             # Select those photons with U <= max of cdf of specific channel
-            sel_photon_id = np.where(rU0 <= delaytime_cdf[signal_pulse._photon_channels, -1])[0]
+            cdf_max = delaytime_cdf[signal_pulse._photon_channels, -1]
+            sel_photon_id = np.where(rU0 <= cdf_max * self.config['pmt_ap_modifier'])[0]
             if len(sel_photon_id) == 0: continue
             sel_photon_channel = signal_pulse._photon_channels[sel_photon_id]
 
@@ -597,10 +665,11 @@ class PMT_Afterpulse(Pulse):
                     delaytime_cdf[sel_photon_channel, 1])                
                 ap_amplitude = np.ones_like(ap_delay)
             else:
-                ap_delay = np.argmin(
+                ap_delay = (np.argmin(
                     np.abs(
                         delaytime_cdf[sel_photon_channel]
                         - rU0[sel_photon_id][:, None]), axis=-1)
+                            - self.config['pmt_ap_t_modifier'])
                 ap_amplitude = np.argmin(
                     np.abs(
                         amplitude_cdf[sel_photon_channel]
@@ -626,11 +695,14 @@ class RawData(object):
             s1=S1(config),
             s2=S2(config),
             pi_el=PhotoIonization_Electron(config),
+            pe_el=PhotoElectric_Electron(config),
             pmt_ap=PMT_Afterpulse(config),
         )
-        self.resource = Resource(self.config)
+        self.resource = load_config(self.config)
 
-    def __call__(self, instructions, truth_buffer=[]):
+    def __call__(self, instructions, truth_buffer=None):
+        if truth_buffer is None:
+            truth_buffer = []
 
         # Pre-load some constents from config
         v = self.config['drift_velocity_liquid']
@@ -647,6 +719,7 @@ class RawData(object):
 
         # Primary instructions must be sorted by signal time
         # int(type) by design S1-esque being odd, S2-esque being even
+        # thus type%2-1 is 0:S1-esque;  -1:S2-esque
         # Make a list of clusters of instructions, with gap smaller then rext
         inst_time = instructions['time'] + instructions['z']  / v * (instructions['type'] % 2 - 1)
         inst_queue = np.argsort(inst_time)
@@ -680,7 +753,7 @@ class RawData(object):
             instb_queue = np.split(instb_queue, 
                 np.where(np.diff(instb_time[instb_queue]) > rext)[0]+1)
             
-            # C) Push pulse cache out first if nothing right after them
+            # C) Push pulse cache out first if nothing comes right after them
             if np.min(instb_time) - self.last_pulse_end_time > rext and not np.isinf(self.last_pulse_end_time):
                 self.digitize_pulse_cache()
                 yield from self.ZLE()
@@ -688,7 +761,7 @@ class RawData(object):
             # D) Run all clusters before the current source
             stop_at_this_group = False
             for ibqs in instb_queue:
-                for ptype in [1, 2, 3, 4]:
+                for ptype in [1, 2, 4, 6]: # S1 S2 PI Gate
                     mask = instb_type[ibqs] == ptype
                     if np.sum(mask) == 0: continue # No such instruction type
                     instb_run = instb_indx[ibqs[mask]] # Take hold of todo list
@@ -719,28 +792,49 @@ class RawData(object):
 
     @staticmethod
     def symtype(ptype):
-        return ['s1', 's2', 'unknown', 'pi_el', 'pmt_ap'][ptype - 1]
+        return PULSE_TYPE_NAMES[ptype]
 
     def sim_data(self, instruction):
+        """Simulate a pulse according to instruction, and yield any additional instructions
+        for secondary electron afterpulses.
+        """
+        # Any additional fields in instruction correspond to temporary
+        # configuration overrides. No need to restore the old config:
+        # next instruction cannot but contain the same fields.
         if len(instruction) > 8:
             for par in instruction.dtype.names:
                 if par in self.config:
                     self.config[par] = instruction[par]
-        ptype = self.symtype(instruction['type'][0])
-        self.pulses[ptype](instruction)
-        self.pulses['pmt_ap'](self.pulses[ptype])
-        
-        for pt in [ptype, 'pmt_ap']:
+
+        # Simulate the primary pulse
+        primary_pulse = self.symtype(instruction['type'][0])
+        self.pulses[primary_pulse](instruction)
+
+        # Add PMT afterpulses, if requested
+        do_pmt_ap = self.config.get('enable_pmt_afterpulses', True)
+        if do_pmt_ap:
+            self.pulses['pmt_ap'](self.pulses[primary_pulse])
+
+        # Append pulses we just simulated to our cache
+        for pt in [primary_pulse, 'pmt_ap']:
+            if pt == 'pmt_ap' and not do_pmt_ap:
+                continue
+
             _pulses = getattr(self.pulses[pt], '_pulses')
             if len(_pulses) > 0:
                 self._pulses_cache += _pulses
-                self.last_pulse_end_time = max(self.last_pulse_end_time,
+                self.last_pulse_end_time = max(
+                    self.last_pulse_end_time,
                     np.max([p['right'] for p in _pulses]) * 10)
 
-        if ptype in ['s1', 's2']:
-            yield self.pulses['pi_el'].generate_instruction(
-                self.pulses[ptype], instruction)
-
+        # Make new instructions for electron afterpulses, if requested
+        if primary_pulse in ['s1', 's2']:
+            if self.config.get('enable_electron_afterpulses', True):
+                yield self.pulses['pi_el'].generate_instruction(
+                    self.pulses[primary_pulse], instruction)
+                if primary_pulse in ['s2']: # Only add gate ap to s2
+                    yield self.pulses['pe_el'].generate_instruction(
+                        self.pulses[primary_pulse], instruction)
             self.instruction_event_number = instruction['event_number'][0]
         
     def digitize_pulse_cache(self):
@@ -756,7 +850,7 @@ class RawData(object):
 
             self.left = np.min([p['left'] for p in self._pulses_cache]) - self.config['trigger_window']
             self.right = np.max([p['right'] for p in self._pulses_cache]) + self.config['trigger_window']
-            assert self.right - self.left < 100000, "Pulse cache too long"
+            assert self.right - self.left < 200000, "Pulse cache too long"
 
             if self.left % 2 != 0: self.left -= 1 # Seems like a digizier effect
 
@@ -790,9 +884,9 @@ class RawData(object):
         for ix, data in enumerate(self._raw_data):
             # For simulated data taking reference baseline as baseline
             # Operating directly on digitized downward waveform        
-            if ix in self.config.get('special_thresholds', {}):
+            if str(ix) in self.config.get('special_thresholds', {}):
                 threshold = self.config['digitizer_reference_baseline'] \
-                    - self.config['special_thresholds'][str(pulse.channel)] - 1
+                    - self.config['special_thresholds'][str(ix)] - 1
             else:
                 threshold = self.config['digitizer_reference_baseline'] - self.config['zle_threshold'] - 1
 
@@ -814,42 +908,64 @@ class RawData(object):
                 yield ix, self.left + itv[0], self.left + itv[1], data[itv[0]:itv[1]+1]
 
     def get_truth(self, instruction, truth_buffer):
-        ix = np.argmin(truth_buffer['fill']) # Index of the first line not filled
-        pulse = self.pulses[self.symtype(instruction['type'][0])]
-        for name in 'photon', 'electron':
-            times = getattr(pulse, '_{name}_timings'.format(name=name), [])
-            if len(times) != 0:
-                truth_buffer[ix]['n_{name}'.format(name=name)] = len(times)
-                truth_buffer[ix]['t_mean_{name}'.format(name=name)] = np.mean(times)
-                truth_buffer[ix]['t_first_{name}'.format(name=name)] = np.min(times)
-                truth_buffer[ix]['t_last_{name}'.format(name=name)] = np.max(times)
-                truth_buffer[ix]['t_sigma_{name}'.format(name=name)] = np.std(times)
+        """Write truth in the first empty row of truth_buffer
+
+        :param instruction: Array of instructions that were simulated as a
+        single cluster, and should thus get one line in the truth info.
+        :param truth_buffer: Truth buffer to write in.
+        """
+        ix = np.argmin(truth_buffer['fill'])
+        tb = truth_buffer[ix]
+        peak_type = self.symtype(instruction['type'][0])
+        pulse = self.pulses[peak_type]
+
+        for quantum in 'photon', 'electron':
+            times = getattr(pulse, f'_{quantum}_timings', [])
+            # Set an endtime (if times has no length)
+            tb['endtime'] = np.mean(instruction['time'])
+            if len(times):
+                tb[f'n_{quantum}'] = len(times)
+                tb[f't_mean_{quantum}'] = np.mean(times)
+                tb[f't_first_{quantum}'] = np.min(times)
+                tb[f't_last_{quantum}'] = np.max(times)
+                tb[f't_sigma_{quantum}'] = np.std(times)
+                tb['endtime'] = tb['t_last_photon']
             else:
-                if self.symtype(instruction['type'][0]) not in ['s1', 's2']: return
-                truth_buffer[ix]['n_{name}'.format(name=name)] = 0
-                truth_buffer[ix]['t_mean_{name}'.format(name=name)] = np.nan
-                truth_buffer[ix]['t_first_{name}'.format(name=name)] = np.nan
-                truth_buffer[ix]['t_last_{name}'.format(name=name)] = np.nan
-                truth_buffer[ix]['t_sigma_{name}'.format(name=name)] = np.nan
-            truth_buffer[ix]['endtime'] = np.max(
-                [truth_buffer[ix]['t_last_photon'], truth_buffer[ix]['t_last_electron']]).astype(np.int64)
-        # Area fraction top
-        channels = getattr(self.pulses[self.symtype(instruction['type'][0])], 
-            '_photon_channels', [])
+                # Peak does not have photons / electrons
+                # zero-photon afterpulses can be removed from truth info
+                if peak_type not in ['s1', 's2'] and quantum == 'photon':
+                    return
+                tb[f'n_{quantum}'] = 0
+                tb[f't_mean_{quantum}'] = np.nan
+                tb[f't_first_{quantum}'] = np.nan
+                tb[f't_last_{quantum}'] = np.nan
+                tb[f't_sigma_{quantum}'] = np.nan
+
+        channels = getattr(pulse, '_photon_channels', [])
         n_dpe = getattr(pulse, '_n_double_pe', 0)
         n_dpe_bot = getattr(pulse, '_n_double_pe_bot', 0)
-        truth_buffer[ix]['n_photon'] += n_dpe
-        truth_buffer[ix]['n_photon_bottom'] = np.sum(np.isin(channels, self.config['channels_bottom'])) \
-            + n_dpe_bot
-        # Copy-pasting instruction
-        for name in instruction.dtype.names:
-            if len(instruction) > 1 and name in 'txyz':
-                truth_buffer[ix][name] = np.average(instruction[name])
-            elif len(instruction) > 1 and name == 'amp':
-                truth_buffer[ix][name] = np.sum(instruction[name])
+        tb['n_photon'] += n_dpe
+        tb['n_photon'] -= np.sum(np.isin(channels, getattr(pulse, 'turned_off_pmts', [])))
+
+        channels_bottom = list(
+            set(self.config['channels_bottom']).difference(getattr(pulse, 'turned_off_pmts', [])))
+        tb['n_photon_bottom'] = (
+            np.sum(np.isin(channels, channels_bottom))
+            + n_dpe_bot)
+
+        # Summarize the instruction cluster in one row of the truth file
+        for field in instruction.dtype.names:
+            value = instruction[field]
+            if len(instruction) > 1 and field in 'txyz':
+                tb[field] = np.mean(value)
+            elif len(instruction) > 1 and field == 'amp':
+                tb[field] = np.sum(value)
             else:
-                truth_buffer[ix][name] = instruction[name][0]
-        truth_buffer[ix]['fill'] = True
+                # Cannot summarize intelligently: just take the first value
+                tb[field] = value[0]
+
+        # Signal this row is now filled, so it won't be overwritten
+        tb['fill'] = True
 
     def get_real_noise(self, length):
         """

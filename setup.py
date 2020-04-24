@@ -1,7 +1,9 @@
 import setuptools
 
 with open('requirements.txt') as f:
-    requires = f.read().splitlines()
+    requires = [
+        r.split('/')[-1] if r.startswith('git+') else r
+        for r in f.read().splitlines()]
 
 with open('README.md') as file:
     readme = file.read()
@@ -11,7 +13,7 @@ with open('HISTORY.md') as file:
 
 setuptools.setup(
     name='wfsim',
-    version='0.0.3',
+    version='0.0.4',
     description='XENONnT Waveform simulator',
     author='Wfsim contributors, the XENON collaboration',
     url='https://github.com/XENONnT/wfsim',
